@@ -30,7 +30,9 @@ set -e  # Exit on error
 # =============================================================================
 
 # Data paths
-IMAGENET_DIR="${IMAGENET_DIR:-/path/to/imagenet/train}"
+# NOTE: IMAGENET_DIR must be set before running (unless using --dummy mode)
+# Set via environment variable or --imagenet-dir argument
+IMAGENET_DIR="${IMAGENET_DIR:-}"
 CACHED_LATENTS_DIR="${CACHED_LATENTS_DIR:-./data/cached_latents}"
 OUTPUT_DIR="${OUTPUT_DIR:-./outputs}"
 MAE_WEIGHTS_DIR="${MAE_WEIGHTS_DIR:-./weights/mae}"
@@ -157,12 +159,24 @@ run_data_preparation() {
             --output_dir "$CACHED_LATENTS_DIR" \
             --device "$DEVICE"
     else
+        # Validate IMAGENET_DIR is set
+        if [[ -z "$IMAGENET_DIR" ]]; then
+            echo "Error: IMAGENET_DIR is not set."
+            echo ""
+            echo "Please specify the ImageNet training data path using one of:"
+            echo "  1. Environment variable: export IMAGENET_DIR=/path/to/imagenet/train"
+            echo "  2. Command line: ./run_reproduction.sh --imagenet-dir /path/to/imagenet/train"
+            echo ""
+            echo "Or use --dummy mode for testing: ./run_reproduction.sh --dummy"
+            exit 1
+        fi
+        
         echo "Caching ImageNet images from: $IMAGENET_DIR"
         echo "Output directory: $CACHED_LATENTS_DIR"
         
         if [[ ! -d "$IMAGENET_DIR" ]]; then
             echo "Error: ImageNet directory not found: $IMAGENET_DIR"
-            echo "Please set IMAGENET_DIR or use --imagenet-dir"
+            echo "Please verify the path is correct."
             exit 1
         fi
         

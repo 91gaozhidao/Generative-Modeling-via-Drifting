@@ -300,23 +300,30 @@ def compute_fid(
         )
     elif dataset_name is not None:
         # Use built-in dataset statistics from clean-fid
-        # Supported: FFHQ, ImageNet, etc.
+        # Common supported datasets: FFHQ, cifar10, stl10
+        # Note: Some datasets may require pre-computed statistics
         print(f"Using built-in statistics for: {dataset_name}")
-        fid_score = fid.compute_fid(
-            fdir1=generated_dir,
-            dataset_name=dataset_name,
-            dataset_res=dataset_res,
-            dataset_split=dataset_split,
-            mode="clean",
-            batch_size=batch_size,
-            device=torch.device(device),
-            verbose=True,
-        )
+        try:
+            fid_score = fid.compute_fid(
+                fdir1=generated_dir,
+                dataset_name=dataset_name,
+                dataset_res=dataset_res,
+                dataset_split=dataset_split,
+                mode="clean",
+                batch_size=batch_size,
+                device=torch.device(device),
+                verbose=True,
+            )
+        except Exception as e:
+            print(f"Error computing FID with dataset '{dataset_name}': {e}")
+            print("This dataset may not have pre-computed statistics available.")
+            print("Consider using --imagenet_val with a reference directory instead.")
+            return -1.0
     else:
         print("Error: Must specify either reference_dir or dataset_name")
         print("Examples:")
         print("  --imagenet_val /path/to/imagenet/val")
-        print("  --dataset_name imagenet")
+        print("  --dataset_name FFHQ")
         return -1.0
     
     return fid_score
@@ -373,7 +380,12 @@ def main():
         "--dataset_name",
         type=str,
         default=None,
-        help="Built-in dataset name for clean-fid (e.g., 'imagenet', 'FFHQ')",
+        help=(
+            "Built-in dataset name for clean-fid statistics. "
+            "Common options: 'FFHQ', 'cifar10', 'stl10'. "
+            "Note: ImageNet statistics may need to be computed first. "
+            "See clean-fid documentation for available datasets."
+        ),
     )
     
     # Output arguments
