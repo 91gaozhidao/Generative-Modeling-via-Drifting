@@ -13,6 +13,7 @@ from .models.drifting_loss import DriftingLoss
 from .models.feature_extractor import FeatureExtractor
 from .utils.drifting_field import compute_V, compute_kernel
 from .data.sample_queue import SampleQueue
+from .data.dataset import LatentDataset, DummyLatentDataset, create_dataloader
 
 __all__ = [
     "DriftingDiT",
@@ -21,4 +22,7 @@ __all__ = [
     "compute_V",
     "compute_kernel",
     "SampleQueue",
+    "LatentDataset",
+    "DummyLatentDataset",
+    "create_dataloader",
 ]
