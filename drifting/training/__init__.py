@@ -368,7 +368,7 @@ def create_trainer(
     model: DriftingDiT,
     feature_extractor: str = 'latent',
     learning_rate: float = 1e-4,
-    weight_decay: float = 0.01,
+    weight_decay: float = 0.0,
     warmup_steps: int = 5000,
     total_steps: int = 1000000,
     device: str = "cuda",
@@ -396,12 +396,12 @@ def create_trainer(
         in_channels=model.in_chans,
     )
     
-    # Create optimizer with weight decay
+    # Create optimizer with Paper Table 8 settings: no weight decay, standard Adam betas
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=learning_rate,
         weight_decay=weight_decay,
-        betas=(0.9, 0.95),
+        betas=(0.9, 0.999),
     )
     
     # Create cosine scheduler with warmup
