@@ -16,7 +16,43 @@ from drifting.models.drifting_dit import (
     PatchEmbed,
     DriftingTransformerBlock,
     MultiHeadAttention,
+    RMSNorm,
 )
+
+
+class TestRMSNorm:
+    """Tests for RMSNorm (Paper Appendix A.2)."""
+    
+    def test_output_shape(self):
+        """Test that output has correct shape."""
+        norm = RMSNorm(dim=256)
+        x = torch.randn(32, 10, 256)
+        y = norm(x)
+        assert y.shape == x.shape
+    
+    def test_learnable_weight(self):
+        """Test that weight is learnable."""
+        norm = RMSNorm(dim=256)
+        assert norm.weight.requires_grad
+        assert norm.weight.shape == (256,)
+    
+    def test_normalization(self):
+        """Test that output has unit RMS per sample."""
+        norm = RMSNorm(dim=256)
+        x = torch.randn(32, 10, 256) * 10  # Large input
+        y = norm(x)
+        # With default weight=1, RMS should be approximately 1
+        rms = torch.sqrt((y ** 2).mean(dim=-1))
+        assert rms.mean().item() == pytest.approx(1.0, abs=0.1)
+    
+    def test_gradient_flow(self):
+        """Test that gradients flow through normalization."""
+        norm = RMSNorm(dim=256)
+        x = torch.randn(32, 10, 256, requires_grad=True)
+        y = norm(x)
+        loss = y.sum()
+        loss.backward()
+        assert x.grad is not None
 
 
 class TestSwiGLU:
@@ -264,6 +300,24 @@ class TestDriftingDiT:
         
         assert small.embed_dim < base.embed_dim < large.embed_dim
         assert len(small.blocks) < len(base.blocks) < len(large.blocks)
+    
+    def test_element_wise_sum_conditioning(self):
+        """Test that conditioning uses element-wise sum (Paper Appendix A.2)."""
+        model = DriftingDiTSmall(
+            img_size=32, patch_size=2, in_chans=4,
+            num_classes=10, num_style_tokens=8
+        )
+        
+        # Verify transformer blocks use embed_dim (not 3*embed_dim) for cond_size
+        # This confirms element-wise sum is being used
+        for block in model.blocks:
+            # AdaLN linear layer should expect embed_dim, not 3*embed_dim
+            expected_in_features = model.embed_dim
+            actual_in_features = block.adaLN.linear.in_features
+            assert actual_in_features == expected_in_features, (
+                f"Expected cond_size={expected_in_features} (element-wise sum), "
+                f"got {actual_in_features}. Paper specifies summing embeddings."
+            )
 
 
 class TestDriftingDiTMemory:

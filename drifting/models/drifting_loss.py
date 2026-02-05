@@ -136,6 +136,7 @@ class DriftingLoss(nn.Module):
         feat_gen: torch.Tensor,
         feat_data: torch.Tensor,
         temperature: float,
+        num_channels: int = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Compute drifting loss at a single feature scale.
@@ -143,16 +144,24 @@ class DriftingLoss(nn.Module):
         Args:
             feat_gen: Generated features of shape (B, D)
             feat_data: Data features of shape (N, D)
-            temperature: Temperature for softmax normalization
+            temperature: Base temperature for softmax normalization
+            num_channels: Number of channels for temperature scaling (Paper Eq. 22)
             
         Returns:
             Tuple of (loss, drift field V)
         """
+        # Temperature scaling per Paper Eq. 22: τ_l = τ / sqrt(C_l)
+        # This ensures features from different layers contribute equally to the loss
+        if num_channels is not None and num_channels > 0:
+            scaled_temperature = temperature / (num_channels ** 0.5)
+        else:
+            scaled_temperature = temperature
+        
         # Compute drifting field
         V = compute_V(
             feat_gen, feat_data, feat_gen,
             sigma=self.sigma,
-            temperature=temperature,
+            temperature=scaled_temperature,
             normalize_features=False,  # Already normalized
             normalize_drift=False,  # Normalize after
         )
@@ -195,17 +204,20 @@ class DriftingLoss(nn.Module):
         drift_fields = []
         
         for scale_idx, (feat_gen, feat_data) in enumerate(zip(feats_gen, feats_data)):
+            # Get number of channels for temperature scaling (Paper Eq. 22)
+            num_channels = feat_gen.shape[1] if feat_gen.dim() == 4 else feat_gen.shape[-1]
+            
             # Normalize features
             feat_gen_norm = self.normalize_feature_map(feat_gen)
             feat_data_norm = self.normalize_feature_map(feat_data)
             
-            # Compute loss at multiple temperatures
+            # Compute loss at multiple temperatures with channel-based scaling
             scale_loss = 0.0
             scale_drifts = []
             
             for temp in self.temperatures:
                 loss, V = self.compute_scale_loss(
-                    feat_gen_norm, feat_data_norm, temp
+                    feat_gen_norm, feat_data_norm, temp, num_channels=num_channels
                 )
                 scale_loss = scale_loss + loss
                 scale_drifts.append(V)
@@ -257,6 +269,9 @@ class DriftingLoss(nn.Module):
         for scale_idx, (feat_gen, feat_data, feat_uncond) in enumerate(
             zip(feats_gen, feats_data, feats_uncond)
         ):
+            # Get number of channels for temperature scaling (Paper Eq. 22)
+            num_channels = feat_gen.shape[1] if feat_gen.dim() == 4 else feat_gen.shape[-1]
+            
             # Normalize features
             feat_gen_norm = self.normalize_feature_map(feat_gen)
             feat_data_norm = self.normalize_feature_map(feat_data)
@@ -266,15 +281,18 @@ class DriftingLoss(nn.Module):
             # Higher CFG = more emphasis on conditional, less on unconditional
             w_uncond = 1.0 / (cfg_scale + 1)  # Weight for unconditional
             
-            # Compute loss at multiple temperatures
+            # Compute loss at multiple temperatures with channel-based scaling
             scale_loss = 0.0
             
             for temp in self.temperatures:
+                # Apply temperature scaling per Paper Eq. 22: τ_l = τ / sqrt(C_l)
+                scaled_temp = temp / (num_channels ** 0.5) if num_channels > 0 else temp
+                
                 # Conditional drifting field
                 V_cond = compute_V(
                     feat_gen_norm, feat_data_norm, feat_gen_norm,
                     sigma=self.sigma,
-                    temperature=temp,
+                    temperature=scaled_temp,
                     normalize_features=False,
                     normalize_drift=False,
                 )
@@ -283,7 +301,7 @@ class DriftingLoss(nn.Module):
                 V_uncond = compute_V(
                     feat_gen_norm, feat_uncond_norm, feat_gen_norm,
                     sigma=self.sigma,
-                    temperature=temp,
+                    temperature=scaled_temp,
                     normalize_features=False,
                     normalize_drift=False,
                 )

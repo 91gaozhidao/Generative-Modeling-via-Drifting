@@ -20,6 +20,34 @@ from typing import Optional, Tuple
 from einops import rearrange, repeat
 
 
+class RMSNorm(nn.Module):
+    """
+    Root Mean Square Layer Normalization (RMSNorm).
+    
+    As specified in Paper Appendix A.2, RMSNorm is used instead of LayerNorm
+    for better training stability in deep transformers.
+    
+    Reference: Zhang & Sennrich, 2019 "Root Mean Square Layer Normalization"
+    
+    Args:
+        dim: Dimension of the input features
+        eps: Small epsilon for numerical stability
+    """
+    
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+    
+    def _norm(self, x: torch.Tensor) -> torch.Tensor:
+        """Compute RMS normalization."""
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply RMS normalization with learnable scale."""
+        return self._norm(x.float()).type_as(x) * self.weight
+
+
 class SwiGLU(nn.Module):
     """
     SwiGLU activation function.
@@ -90,15 +118,16 @@ def apply_rotary_pos_emb(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, si
 
 class QKNorm(nn.Module):
     """
-    QK-Norm: LayerNorm applied to queries and keys for training stability.
+    QK-Norm: RMSNorm applied to queries and keys for training stability.
     
     This helps prevent attention entropy collapse during training.
+    Uses RMSNorm per Paper Appendix A.2.
     """
     
     def __init__(self, dim: int, eps: float = 1e-6):
         super().__init__()
-        self.q_norm = nn.LayerNorm(dim, eps=eps)
-        self.k_norm = nn.LayerNorm(dim, eps=eps)
+        self.q_norm = RMSNorm(dim, eps=eps)
+        self.k_norm = RMSNorm(dim, eps=eps)
     
     def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         return self.q_norm(q), self.k_norm(k)
@@ -110,11 +139,12 @@ class AdaLNZero(nn.Module):
     
     Used for conditioning on class labels and CFG scale.
     Outputs: (shift, scale, gate) for modulating layer outputs.
+    Uses RMSNorm per Paper Appendix A.2.
     """
     
     def __init__(self, hidden_size: int, cond_size: int):
         super().__init__()
-        self.norm = nn.LayerNorm(hidden_size, elementwise_affine=False)
+        self.norm = RMSNorm(hidden_size)
         self.linear = nn.Linear(cond_size, 6 * hidden_size)
         
         # Zero-initialize the linear layer
@@ -395,8 +425,10 @@ class DriftingDiT(nn.Module):
         # Style tokens
         self.style_tokens = StyleTokens(num_style_tokens, embed_dim)
         
-        # Conditioning size (class + CFG + style)
-        cond_size = embed_dim * 3
+        # Conditioning size: Paper Appendix A.2 specifies element-wise sum
+        # "These are summed and added to the conditioning vector"
+        # This introduces negligible overhead compared to concatenation
+        cond_size = embed_dim
         
         # Transformer blocks
         self.blocks = nn.ModuleList([
@@ -411,7 +443,7 @@ class DriftingDiT(nn.Module):
         ])
         
         # Final layer
-        self.final_norm = nn.LayerNorm(embed_dim)
+        self.final_norm = RMSNorm(embed_dim)
         self.final_proj = nn.Linear(embed_dim, patch_size ** 2 * in_chans)
         
         # Initialize weights
@@ -489,8 +521,10 @@ class DriftingDiT(nn.Module):
         else:
             style_emb = torch.zeros(B, self.embed_dim, device=device, dtype=z.dtype)
         
-        # Concatenate all conditioning
-        cond = torch.cat([class_emb, cfg_emb, style_emb], dim=-1)  # (B, 3*D)
+        # Element-wise sum for conditioning (Paper Appendix A.2)
+        # "These are summed and added to the conditioning vector... 
+        # introduces negligible overhead"
+        cond = class_emb + cfg_emb + style_emb  # (B, D)
         
         # Apply transformer blocks
         for block in self.blocks:
