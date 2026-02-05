@@ -7,17 +7,16 @@ the standard metric for generative model evaluation on ImageNet.
 Key features:
 - Batch generation of 50,000 samples for statistically significant FID
 - Uses clean-fid library (standard ImageNet FID computation tool)
-- Supports both pre-computed statistics and reference image folders
-- Multi-GPU support for faster generation
+- Supports reference image folders or built-in dataset statistics
 
 Usage:
     # Evaluate against ImageNet validation set
     python tools/eval_fid.py --checkpoint ./outputs/checkpoints/best_model.pt \\
         --imagenet_val /path/to/imagenet/val
 
-    # Evaluate against pre-computed statistics
+    # Evaluate against built-in dataset statistics
     python tools/eval_fid.py --checkpoint ./outputs/checkpoints/best_model.pt \\
-        --stats_path imagenet_val_256.npz
+        --dataset_name imagenet
 
     # Quick test with fewer samples
     python tools/eval_fid.py --checkpoint ./outputs/checkpoints/best_model.pt \\
@@ -258,8 +257,9 @@ def generate_samples(
 def compute_fid(
     generated_dir: str,
     reference_dir: Optional[str] = None,
-    stats_path: Optional[str] = None,
     dataset_name: Optional[str] = None,
+    dataset_res: int = 256,
+    dataset_split: str = "train",
     batch_size: int = 64,
     device: str = "cuda",
 ) -> float:
@@ -268,9 +268,10 @@ def compute_fid(
     
     Args:
         generated_dir: Directory containing generated images
-        reference_dir: Directory containing reference images (ImageNet val)
-        stats_path: Path to pre-computed statistics (.npz file)
-        dataset_name: Name of built-in dataset for clean-fid
+        reference_dir: Directory containing reference images (e.g., ImageNet val)
+        dataset_name: Name of built-in dataset for clean-fid (e.g., "imagenet")
+        dataset_res: Resolution for dataset statistics (default: 256)
+        dataset_split: Dataset split for statistics (default: "train")
         batch_size: Batch size for feature extraction
         device: Device for computation
         
@@ -287,47 +288,35 @@ def compute_fid(
     print("\nComputing FID score...")
     
     if reference_dir is not None:
-        # Compute FID against reference directory
-        print(f"Reference: {reference_dir}")
+        # Compute FID against reference directory (most common case)
+        print(f"Reference directory: {reference_dir}")
         fid_score = fid.compute_fid(
-            generated_dir,
-            reference_dir,
+            fdir1=generated_dir,
+            fdir2=reference_dir,
             mode="clean",
             batch_size=batch_size,
             device=torch.device(device),
-        )
-    elif stats_path is not None:
-        # Compute FID against pre-computed statistics
-        print(f"Statistics: {stats_path}")
-        fid_score = fid.compute_fid(
-            generated_dir,
-            dataset_name=None,
-            dataset_res=256,
-            dataset_split="custom",
-            mode="clean",
-            batch_size=batch_size,
-            device=torch.device(device),
-            custom_feat_extractor=None,
-            custom_image_tranform=None,
-            custom_fn_resize=None,
-            use_dataparallel=False,
             verbose=True,
-            custom_stat_path=stats_path,
         )
     elif dataset_name is not None:
-        # Use built-in dataset statistics
-        print(f"Dataset: {dataset_name}")
+        # Use built-in dataset statistics from clean-fid
+        # Supported: FFHQ, ImageNet, etc.
+        print(f"Using built-in statistics for: {dataset_name}")
         fid_score = fid.compute_fid(
-            generated_dir,
+            fdir1=generated_dir,
             dataset_name=dataset_name,
-            dataset_res=256,
-            dataset_split="train",
+            dataset_res=dataset_res,
+            dataset_split=dataset_split,
             mode="clean",
             batch_size=batch_size,
             device=torch.device(device),
+            verbose=True,
         )
     else:
-        print("Error: Must specify either reference_dir, stats_path, or dataset_name")
+        print("Error: Must specify either reference_dir or dataset_name")
+        print("Examples:")
+        print("  --imagenet_val /path/to/imagenet/val")
+        print("  --dataset_name imagenet")
         return -1.0
     
     return fid_score
@@ -373,24 +362,18 @@ def main():
         help="CFG scale for generation (default: 1.5)",
     )
     
-    # Reference arguments (one of these is required)
+    # Reference arguments (one of these is required for FID computation)
     parser.add_argument(
         "--imagenet_val",
         type=str,
         default=None,
-        help="Path to ImageNet validation set",
-    )
-    parser.add_argument(
-        "--stats_path",
-        type=str,
-        default=None,
-        help="Path to pre-computed FID statistics (.npz file)",
+        help="Path to ImageNet validation set directory",
     )
     parser.add_argument(
         "--dataset_name",
         type=str,
         default=None,
-        help="Built-in dataset name for clean-fid (e.g., 'imagenet')",
+        help="Built-in dataset name for clean-fid (e.g., 'imagenet', 'FFHQ')",
     )
     
     # Output arguments
@@ -423,9 +406,9 @@ def main():
     args = parser.parse_args()
     
     # Validate arguments
-    if args.imagenet_val is None and args.stats_path is None and args.dataset_name is None:
+    if args.imagenet_val is None and args.dataset_name is None:
         print("Warning: No reference specified. Will generate samples only.")
-        print("To compute FID, specify one of: --imagenet_val, --stats_path, or --dataset_name")
+        print("To compute FID, specify one of: --imagenet_val or --dataset_name")
     
     # Set seed
     torch.manual_seed(args.seed)
@@ -477,11 +460,10 @@ def main():
     print(f"  Rate: {num_generated / generation_time:.1f} images/sec")
     
     # Compute FID if reference is specified
-    if args.imagenet_val is not None or args.stats_path is not None or args.dataset_name is not None:
+    if args.imagenet_val is not None or args.dataset_name is not None:
         fid_score = compute_fid(
             generated_dir=args.output_dir,
             reference_dir=args.imagenet_val,
-            stats_path=args.stats_path,
             dataset_name=args.dataset_name,
             batch_size=args.batch_size,
             device=args.device,
