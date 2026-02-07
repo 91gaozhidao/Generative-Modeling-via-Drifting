@@ -68,7 +68,7 @@ class DriftingLoss(nn.Module):
         
         # Build feature extractor
         if isinstance(feature_extractor, str):
-            if feature_extractor == 'latent' or feature_extractor == 'mae':
+            if feature_extractor in ('latent', 'mae'):
                 self.feature_extractor = LatentFeatureExtractor(in_channels=in_channels)
             elif feature_extractor.startswith('resnet'):
                 self.feature_extractor = FeatureExtractor(

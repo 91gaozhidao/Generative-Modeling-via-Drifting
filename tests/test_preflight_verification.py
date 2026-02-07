@@ -190,7 +190,8 @@ class TestRegisterTokensSequenceLength:
         
         assert model.num_patches == num_patches
         assert model.num_register_tokens == num_register_tokens
-        # Total sequence length in forward pass will be 272
+        # Verify expected total sequence length calculation
+        assert expected_seq_len == 272  # 256 patches + 16 register tokens
     
     def test_rope_handles_extended_sequence(self):
         """Test that RoPE can handle sequence length 272."""
