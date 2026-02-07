@@ -312,6 +312,39 @@ class TestDriftingDiT:
         assert small.embed_dim < base.embed_dim < large.embed_dim
         assert len(small.blocks) < len(base.blocks) < len(large.blocks)
     
+    def test_dit_large_config(self):
+        """Test DiT-L/2 configuration matches paper specification (Deng et al., 2026)."""
+        from drifting.models.drifting_dit import DriftingDiTLarge
+        
+        model = DriftingDiTLarge(img_size=32, patch_size=2, num_classes=1000)
+        
+        # Core architecture (DiT-L/2)
+        assert model.embed_dim == 1024, "Hidden size must be 1024"
+        assert len(model.blocks) == 24, "Depth must be 24 transformer blocks"
+        assert model.blocks[0].attn.num_heads == 16, "Must have 16 attention heads"
+        assert model.patch_size == 2, "Patch size must be 2"
+        
+        # In-context Register Tokens (Paper A.2): 16 learnable tokens
+        assert model.num_register_tokens == 16, "Must have 16 register tokens"
+        assert model.register_tokens.shape == (1, 16, 1024)
+        
+        # Style Tokens Codebook (Paper A.2): 64-entry codebook, sample 32, sum
+        assert model.codebook_size == 64, "Codebook size must be 64"
+        assert model.num_style_samples == 32, "Must sample 32 style tokens"
+        assert model.style_codebook.shape == (64, 1024)
+        
+        # Sequence length: 16 register tokens + 256 patch tokens = 272
+        num_patches = (32 // 2) ** 2  # 256
+        expected_seq_len = 16 + num_patches  # 272
+        assert model.num_patches == num_patches
+        assert model.num_register_tokens + model.num_patches == expected_seq_len
+        
+        # Verify forward pass produces correct output
+        z = torch.randn(2, 4, 32, 32)
+        y = torch.randint(0, 1000, (2,))
+        out = model(z, y, cfg_scale=1.5)
+        assert out.shape == (2, 4, 32, 32)
+    
     def test_element_wise_sum_conditioning(self):
         """Test that conditioning uses element-wise sum (Paper Appendix A.2)."""
         model = DriftingDiTSmall(
