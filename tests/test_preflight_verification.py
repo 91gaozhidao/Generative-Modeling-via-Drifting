@@ -136,35 +136,33 @@ class TestFeatureExtractorFreezing:
     
     def test_batchnorm_stats_not_updated_when_frozen(self):
         """
-        Test that BatchNorm running stats are not updated when frozen.
+        Test that normalization layer parameters are not updated when frozen.
         
-        This verifies the critical requirement that class-grouped batches
-        don't pollute the BatchNorm statistics.
+        The feature extractor uses GroupNorm (per paper A.3) which has no
+        running statistics, making it inherently safe against class-grouped
+        batch stat corruption. This test verifies that all parameters remain
+        unchanged after a forward pass when frozen.
         """
         loss_fn = DriftingLoss(feature_extractor='latent', in_channels=4)
         loss_fn.freeze_feature_extractor()
         
-        # Get initial BatchNorm running mean
-        initial_running_means = []
-        for module in loss_fn.feature_extractor.modules():
-            if isinstance(module, torch.nn.BatchNorm2d):
-                initial_running_means.append(module.running_mean.clone())
+        # Snapshot all parameter values
+        initial_params = {
+            name: p.clone()
+            for name, p in loss_fn.feature_extractor.named_parameters()
+        }
         
-        assert len(initial_running_means) > 0, "No BatchNorm layers found"
+        assert len(initial_params) > 0, "No parameters found in feature extractor"
         
         # Forward pass with data
         x = torch.randn(8, 4, 32, 32)
         loss_fn.feature_extractor(x)
         
-        # Check that running means have not changed
-        idx = 0
-        for module in loss_fn.feature_extractor.modules():
-            if isinstance(module, torch.nn.BatchNorm2d):
-                assert torch.allclose(
-                    module.running_mean, 
-                    initial_running_means[idx]
-                ), "BatchNorm running mean changed when feature extractor should be frozen!"
-                idx += 1
+        # Check that all parameter values remain unchanged
+        for name, p in loss_fn.feature_extractor.named_parameters():
+            assert torch.allclose(
+                p, initial_params[name]
+            ), f"Parameter {name} changed when feature extractor should be frozen!"
 
 
 class TestRegisterTokensSequenceLength:

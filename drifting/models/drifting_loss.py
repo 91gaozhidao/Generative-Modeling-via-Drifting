@@ -83,8 +83,12 @@ class DriftingLoss(nn.Module):
         # Track whether feature extractor is frozen
         self._feature_extractor_frozen = False
         
-        # Loss weights for each scale
-        num_scales = 4  # Default 4 scales
+        # Loss weights for each scale – derive count from the feature extractor
+        # when the caller hasn't specified explicit weights
+        if hasattr(self.feature_extractor, 'feature_dims'):
+            num_scales = len(self.feature_extractor.feature_dims)
+        else:
+            num_scales = 4  # Fallback
         if loss_weights is None:
             loss_weights = [1.0] * num_scales
         self.register_buffer('loss_weights', torch.tensor(loss_weights))
@@ -94,17 +98,17 @@ class DriftingLoss(nn.Module):
         Freeze the feature extractor for training.
         
         CRITICAL for single-GPU training with Class-Grouped Sampling (Paper requirement):
-        - Sets feature extractor to eval() mode to disable BatchNorm running stats updates
+        - Sets feature extractor to eval() mode
         - Sets requires_grad=False for all parameters to prevent gradient computation
         
-        This MUST be called when using pretrained MAE encoder to prevent:
-        1. BatchNorm statistics corruption from class-grouped batches
-        2. Unintended updates to feature extractor weights during training
+        This MUST be called when using pretrained MAE encoder to prevent
+        unintended updates to feature extractor weights during training.
         
-        Per Paper review: "Feature Extractor (MAE) MUST be in .eval() mode with 
-        requires_grad=False to prevent BatchNorm statistics pollution from grouped batches."
+        Note: The feature extractor uses GroupNorm (per paper A.3), which has no
+        running statistics, making it inherently safe against batch stat corruption.
+        However, freezing is still required to prevent weight updates.
         """
-        # Set to eval mode - critical for BatchNorm layers
+        # Set to eval mode
         self.feature_extractor.eval()
         
         # Freeze all parameters
@@ -157,7 +161,10 @@ class DriftingLoss(nn.Module):
     
     def normalize_feature_map(self, feat: torch.Tensor) -> torch.Tensor:
         """
-        Feature Normalization (Eq. 20).
+        Feature Normalization (Eq. 20) with Dense/Spatial Drifting (Appendix A.5).
+        
+        For 4D feature maps, flatten spatial dimensions to compute one drifting
+        loss per spatial location (dense drifting), NOT via global average pooling.
         
         Scale features so that the average pairwise distance is sqrt(D).
         
@@ -165,11 +172,12 @@ class DriftingLoss(nn.Module):
             feat: Feature map of shape (B, C, H, W) or (B, D)
             
         Returns:
-            Normalized features with average distance = sqrt(D)
+            Normalized features of shape (B*H*W, C) for 4D input, or (B, D) for 2D input
         """
-        # Flatten if needed
+        # Dense spatial flattening: treat each spatial location as an independent sample
         if feat.dim() == 4:
-            feat = F.adaptive_avg_pool2d(feat, 1).flatten(1)  # (B, C)
+            B, C, H, W = feat.shape
+            feat = feat.permute(0, 2, 3, 1).reshape(B * H * W, C)  # (B*H*W, C)
         
         if not self.normalize_features:
             return feat
@@ -278,7 +286,7 @@ class DriftingLoss(nn.Module):
             # We use the channel count C for scaling: τ_l = τ / sqrt(C_l)
             num_channels = feat_gen.shape[1] if feat_gen.dim() == 4 else feat_gen.shape[-1]
             
-            # Normalize features (converts from 4D to 2D via adaptive_avg_pool2d)
+            # Normalize features (dense spatial: 4D (B,C,H,W) -> 2D (B*H*W, C))
             feat_gen_norm = self.normalize_feature_map(feat_gen)
             feat_data_norm = self.normalize_feature_map(feat_data)
             
@@ -345,7 +353,7 @@ class DriftingLoss(nn.Module):
             # We use the channel count C for scaling: τ_l = τ / sqrt(C_l)
             num_channels = feat_gen.shape[1] if feat_gen.dim() == 4 else feat_gen.shape[-1]
             
-            # Normalize features (converts from 4D to 2D via adaptive_avg_pool2d)
+            # Normalize features (dense spatial: 4D (B,C,H,W) -> 2D (B*H*W, C))
             feat_gen_norm = self.normalize_feature_map(feat_gen)
             feat_data_norm = self.normalize_feature_map(feat_data)
             feat_uncond_norm = self.normalize_feature_map(feat_uncond)

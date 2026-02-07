@@ -144,6 +144,83 @@ def validate(
     }
 
 
+def train_cls_step(
+    model: LatentMAE,
+    dataloader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    device: str,
+    max_iters: int = 3000,
+    log_interval: int = 100,
+) -> Dict[str, float]:
+    """
+    Classification fine-tuning loop (Paper Appendix A.3, Table 3).
+    
+    Fine-tunes all parameters with CrossEntropy loss for a fixed number
+    of iterations (default 3k as per paper).
+    
+    Args:
+        model: LatentMAE model (with classifier_head)
+        dataloader: Training data loader (must yield (latents, labels))
+        optimizer: Optimizer
+        device: Device to train on
+        max_iters: Maximum training iterations (default: 3000 per paper)
+        log_interval: Logging interval
+        
+    Returns:
+        Dictionary of training metrics
+    """
+    model.train()
+    criterion = nn.CrossEntropyLoss()
+    
+    total_loss = 0.0
+    total_correct = 0
+    total_samples = 0
+    cur_iter = 0
+    
+    pbar = tqdm(total=max_iters, desc="Classification Fine-tuning")
+    
+    while cur_iter < max_iters:
+        for latents, labels in dataloader:
+            if cur_iter >= max_iters:
+                break
+            
+            latents = latents.to(device)
+            labels = labels.to(device)
+            
+            # Forward through encoder + classification head
+            logits = model.forward_cls(latents)
+            loss = criterion(logits, labels)
+            
+            # Backward pass
+            optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            total_loss += loss.item()
+            preds = logits.argmax(dim=-1)
+            total_correct += (preds == labels).sum().item()
+            total_samples += labels.shape[0]
+            cur_iter += 1
+            
+            if cur_iter % log_interval == 0:
+                acc = total_correct / max(total_samples, 1)
+                avg = total_loss / cur_iter
+                pbar.set_postfix({'loss': f"{avg:.4f}", 'acc': f"{acc:.4f}"})
+                pbar.update(log_interval)
+    
+    pbar.close()
+    
+    avg_loss = total_loss / max(cur_iter, 1)
+    accuracy = total_correct / max(total_samples, 1)
+    
+    return {
+        'avg_loss': avg_loss,
+        'accuracy': accuracy,
+        'num_iters': cur_iter,
+    }
+
+
 def save_checkpoint(
     model: LatentMAE,
     optimizer: torch.optim.Optimizer,
@@ -299,6 +376,31 @@ def main():
         default=32,
         help="Latent spatial size (default: 32)",
     )
+    parser.add_argument(
+        "--blocks_per_stage",
+        type=int,
+        nargs='+',
+        default=[3, 4, 6, 3],
+        help="Number of BasicBlocks per stage (default: 3 4 6 3 for L/2 alignment)",
+    )
+    parser.add_argument(
+        "--finetune_cls",
+        action="store_true",
+        help="Enable classification fine-tuning mode (Paper Appendix A.3). "
+             "Requires --resume to load pre-trained MAE weights.",
+    )
+    parser.add_argument(
+        "--cls_iters",
+        type=int,
+        default=3000,
+        help="Number of classification fine-tuning iterations (default: 3000 per paper)",
+    )
+    parser.add_argument(
+        "--cls_lr",
+        type=float,
+        default=1e-3,
+        help="Learning rate for classification fine-tuning (default: 1e-3)",
+    )
     
     # Training arguments
     parser.add_argument(
@@ -377,7 +479,7 @@ def main():
         "--num_classes",
         type=int,
         default=1000,
-        help="Number of classes for dummy dataset (default: 1000)",
+        help="Number of classes for classification head and dummy dataset (default: 1000)",
     )
     
     args = parser.parse_args()
@@ -441,6 +543,8 @@ def main():
         patch_size=args.patch_size,
         mask_ratio=args.mask_ratio,
         input_size=args.latent_size,
+        blocks_per_stage=args.blocks_per_stage,
+        num_classes=args.num_classes,
     )
     model = model.to(device)
     
@@ -477,6 +581,51 @@ def main():
             model, optimizer, scheduler, args.resume, device
         )
         print(f"Resuming from epoch {start_epoch}, best loss: {best_loss:.4f}")
+    
+    # Classification fine-tuning mode (Paper Appendix A.3, Table 3)
+    if args.finetune_cls:
+        if args.resume is None:
+            parser.error("--finetune_cls requires --resume to load pre-trained MAE weights")
+        
+        print(f"\n{'='*60}")
+        print(f"Classification Fine-tuning for {args.cls_iters} iterations")
+        print(f"{'='*60}\n")
+        
+        # Create a separate optimizer for fine-tuning (fine-tune all per paper)
+        cls_optimizer = torch.optim.AdamW(
+            model.parameters(),
+            lr=args.cls_lr,
+            weight_decay=args.weight_decay,
+            betas=(0.9, 0.95),
+        )
+        
+        cls_metrics = train_cls_step(
+            model=model,
+            dataloader=dataloader,
+            optimizer=cls_optimizer,
+            device=device,
+            max_iters=args.cls_iters,
+            log_interval=args.log_interval,
+        )
+        
+        print(f"\nClassification fine-tuning complete!")
+        print(f"  Final Loss: {cls_metrics['avg_loss']:.4f}")
+        print(f"  Accuracy: {cls_metrics['accuracy']:.4f}")
+        
+        # Save fine-tuned model
+        ft_path = output_dir / "finetuned_cls.pt"
+        save_checkpoint(
+            model, cls_optimizer, None, 0, cls_metrics['avg_loss'],
+            str(ft_path)
+        )
+        
+        # Save encoder with classification fine-tuning
+        ft_encoder_path = output_dir / "finetuned_encoder.pt"
+        save_encoder(model, str(ft_encoder_path))
+        
+        print(f"Fine-tuned encoder saved to {ft_encoder_path}")
+        print(f"{'='*60}\n")
+        return
     
     # Training loop
     print(f"\n{'='*60}")

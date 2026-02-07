@@ -17,26 +17,37 @@ from typing import List, Optional, Tuple
 import torchvision.models as models
 
 
+def _make_norm(channels: int, num_groups: int = 32) -> nn.Module:
+    """Create a GroupNorm layer with a safe number of groups.
+
+    If *channels* is not divisible by *num_groups*, fall back to a smaller
+    divisor so that the layer can still be instantiated.
+    """
+    while num_groups > 1 and channels % num_groups != 0:
+        num_groups //= 2
+    return nn.GroupNorm(num_groups, channels)
+
+
 class ResNetBlock(nn.Module):
-    """Basic ResNet block with skip connection."""
+    """Basic ResNet block with skip connection and GroupNorm (Paper A.3)."""
     
     def __init__(self, in_channels: int, out_channels: int, stride: int = 1):
         super().__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.gn1 = _make_norm(out_channels)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.gn2 = _make_norm(out_channels)
         
         self.shortcut = nn.Sequential()
         if stride != 1 or in_channels != out_channels:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels)
+                _make_norm(out_channels)
             )
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
+        out = F.relu(self.gn1(self.conv1(x)))
+        out = self.gn2(self.conv2(out))
         out = out + self.shortcut(x)
         out = F.relu(out)
         return out
@@ -58,6 +69,8 @@ class FeatureExtractor(nn.Module):
         num_blocks: Number of blocks per stage (default: [2, 2, 2, 2])
         pretrained_encoder: Optional pretrained encoder to use (e.g., 'resnet18')
         freeze_pretrained: Whether to freeze pretrained weights
+        is_latent: If True, use a 3×3 stride-1 stem without MaxPool for
+            latent-space inputs (Paper A.3). Default False.
     """
     
     def __init__(
@@ -67,6 +80,7 @@ class FeatureExtractor(nn.Module):
         num_blocks: List[int] = None,
         pretrained_encoder: Optional[str] = None,
         freeze_pretrained: bool = True,
+        is_latent: bool = False,
     ):
         super().__init__()
         
@@ -75,6 +89,7 @@ class FeatureExtractor(nn.Module):
         
         self.in_channels = in_channels
         self.pretrained_encoder = pretrained_encoder
+        self.is_latent = is_latent
         
         if pretrained_encoder:
             self._build_pretrained(pretrained_encoder, freeze_pretrained)
@@ -100,7 +115,7 @@ class FeatureExtractor(nn.Module):
         else:
             self.input_conv = resnet.conv1
         
-        self.bn1 = resnet.bn1
+        self.norm1 = resnet.bn1
         self.relu = resnet.relu
         self.maxpool = resnet.maxpool
         
@@ -124,11 +139,23 @@ class FeatureExtractor(nn.Module):
                     param.requires_grad = True
     
     def _build_custom(self, in_channels: int, base_channels: int, num_blocks: List[int]):
-        """Build a custom ResNet-style encoder."""
-        self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(base_channels)
+        """Build a custom ResNet-style encoder with GroupNorm (Paper A.3).
+        
+        When ``self.is_latent`` is True the input stem uses a 3×3 stride-1
+        convolution **without** MaxPool, preserving the spatial resolution of
+        small latent inputs (e.g. 32×32).  Otherwise the standard 7×7 stride-2
+        + MaxPool stem is used.
+        """
+        if self.is_latent:
+            # Latent mode: 3×3 stride-1, no MaxPool (Paper A.3)
+            self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        else:
+            # Standard ResNet stem: 7×7 stride-2
+            self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        self.norm1 = _make_norm(base_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        if not self.is_latent:
+            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
         # Build stages
         channels = [base_channels, base_channels * 2, base_channels * 4, base_channels * 8]
@@ -159,9 +186,10 @@ class FeatureExtractor(nn.Module):
         """
         # Initial processing
         x = self.input_conv(x)
-        x = self.bn1(x)
+        x = self.norm1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        if not self.is_latent:
+            x = self.maxpool(x)
         
         # Extract features at each stage
         features = []
@@ -205,12 +233,27 @@ class LatentFeatureExtractor(nn.Module):
     Lightweight feature extractor for VAE latent space.
     
     Since the latent space is already a good representation,
-    we use a simpler encoder that's faster to compute.
+    we use a ResNet-style encoder with BasicBlocks.
+    
+    Per paper Appendix A.3: for latent-space inputs the first stage uses
+    stride 1 (no downsampling) — no stem conv or MaxPool.
+    
+    Per paper Appendix A.5: features are extracted from the output of every
+    2 residual blocks within each stage, together with the final output.
     
     This encoder can be pretrained using MAE (Masked Autoencoding) as described
     in the paper's Appendix A.3:
     > "We use a ResNet-style network... pre-trained with MAE... on the VAE latent space."
     > "We found it crucial to use a feature extractor... raw pixels/latents failed."
+    > "All residual blocks are 'basic' blocks"
+    > "ResNet-style encoder... blocks/stage [3, 4, 6, 3]"
+    
+    Args:
+        in_channels: Input channels (default: 4 for VAE latent)
+        hidden_channels: Base width (default: 64)
+        num_stages: Number of encoder stages (default: 4)
+        blocks_per_stage: Blocks per stage (default: [3, 4, 6, 3])
+        extract_every_n: Extract intermediate features every N blocks (default: 2, per A.5)
     """
     
     def __init__(
@@ -218,41 +261,61 @@ class LatentFeatureExtractor(nn.Module):
         in_channels: int = 4,
         hidden_channels: int = 64,
         num_stages: int = 4,
+        blocks_per_stage: Optional[List[int]] = None,
+        extract_every_n: int = 2,
     ):
         super().__init__()
         
         self.in_channels = in_channels
         self.hidden_channels = hidden_channels
         self.num_stages = num_stages
+        self.extract_every_n = extract_every_n
         self.stages = nn.ModuleList()
+        
+        if blocks_per_stage is None:
+            blocks_per_stage = [3, 4, 6, 3]
+        
+        # Ensure blocks_per_stage matches num_stages
+        if len(blocks_per_stage) < num_stages:
+            blocks_per_stage = blocks_per_stage + [blocks_per_stage[-1]] * (num_stages - len(blocks_per_stage))
+        blocks_per_stage = blocks_per_stage[:num_stages]
         
         in_ch = in_channels
         out_ch = hidden_channels
         
-        for i in range(num_stages):
-            stage = nn.Sequential(
-                nn.Conv2d(in_ch, out_ch, kernel_size=3, stride=2 if i > 0 else 1, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv2d(out_ch, out_ch, kernel_size=3, stride=1, padding=1),
-                nn.BatchNorm2d(out_ch),
-                nn.ReLU(inplace=True),
-            )
-            self.stages.append(stage)
-            in_ch = out_ch
-            out_ch = min(out_ch * 2, 512)
+        # Feature dims: one entry per extraction point
+        self.feature_dims = []
         
-        # Cap channel expansion at 2^3=8x to prevent excessive memory usage
-        # Feature dims: [hidden_channels, hidden_channels*2, hidden_channels*4, hidden_channels*8]
-        MAX_CHANNEL_DOUBLING = 3
-        self.feature_dims = [hidden_channels * (2 ** min(i, MAX_CHANNEL_DOUBLING)) for i in range(num_stages)]
+        for i in range(num_stages):
+            stride = 2 if i > 0 else 1
+            num_blocks = blocks_per_stage[i]
+            
+            # Build stage as ModuleList to allow per-block feature extraction
+            blocks = nn.ModuleList()
+            blocks.append(ResNetBlock(in_ch, out_ch, stride=stride))
+            for _ in range(1, num_blocks):
+                blocks.append(ResNetBlock(out_ch, out_ch, stride=1))
+            
+            self.stages.append(blocks)
+            
+            # Record dims for each extraction point in this stage
+            for b_idx in range(num_blocks):
+                if (b_idx + 1) % extract_every_n == 0 or b_idx == num_blocks - 1:
+                    self.feature_dims.append(out_ch)
+            
+            in_ch = out_ch
+            out_ch = out_ch * 2  # Natural expansion, no cap
     
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Extract multi-scale features."""
+        """Extract multi-scale features with intermediate extraction (Paper A.5)."""
         features = []
-        for stage in self.stages:
-            x = stage(x)
-            features.append(x)
+        for stage_blocks in self.stages:
+            num_blocks = len(stage_blocks)
+            for b_idx, block in enumerate(stage_blocks):
+                x = block(x)
+                # Extract at every Nth block and always at the stage end
+                if (b_idx + 1) % self.extract_every_n == 0 or b_idx == num_blocks - 1:
+                    features.append(x)
         return features
     
     def load_pretrained(self, checkpoint_path: str, strict: bool = True) -> None:
