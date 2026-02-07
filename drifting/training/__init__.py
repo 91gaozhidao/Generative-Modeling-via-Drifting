@@ -17,6 +17,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from typing import Optional, Dict, Any, Callable
 import os
+import warnings
 from tqdm import tqdm
 
 from ..models.drifting_dit import DriftingDiT
@@ -128,6 +129,9 @@ class DriftingTrainer:
         """
         batch_size = x_data.shape[0]
         
+        # Apply VAE latent scaling factor (SD standard)
+        x_data = x_data * 0.18215
+        
         # Add samples to queue
         self.sample_queue.add(x_data, labels)
         
@@ -143,15 +147,20 @@ class DriftingTrainer:
         # Sample CFG scale
         cfg_scale = torch.empty(1).uniform_(*self.cfg_scale_range).item()
         
-        # Sample noise and generate
+        # Sample noise and generate with BF16 mixed precision
         z = torch.randn(batch_size, *self.latent_shape, device=self.device)
-        x_gen = self.model(z, labels_train, cfg_scale=cfg_scale)
         
-        # Get positive samples from queue
-        x_pos = self.sample_queue.sample(labels, num_samples=1)
-        
-        # Compute drifting loss
-        loss = self.loss_fn(x_gen, x_pos)
+        # Use BF16 autocast for A100/Ampere GPUs (CUDA) or skip for CPU/other devices
+        autocast_enabled = self.device == "cuda"
+        autocast_device = self.device if self.device in ["cuda", "cpu"] else "cpu"
+        with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=autocast_enabled):
+            x_gen = self.model(z, labels_train, cfg_scale=cfg_scale)
+            
+            # Get positive samples from queue
+            x_pos = self.sample_queue.sample(labels, num_samples=1)
+            
+            # Compute drifting loss
+            loss = self.loss_fn(x_gen, x_pos)
         
         # Add unconditional samples to queue
         if uncond_mask.any():
@@ -161,8 +170,13 @@ class DriftingTrainer:
         self.optimizer.zero_grad()
         loss.backward()
         
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        # Gradient clipping and norm calculation
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        grad_norm_value = grad_norm.item()
+        
+        # Warn if gradient norm is zero (potential training issue)
+        if grad_norm_value == 0.0:
+            warnings.warn("Gradient norm is 0.0 - model may not be learning!")
         
         self.optimizer.step()
         
@@ -175,6 +189,7 @@ class DriftingTrainer:
             'loss': loss.item(),
             'cfg_scale': cfg_scale,
             'uncond_ratio': uncond_mask.float().mean().item(),
+            'grad_norm': grad_norm_value,
         }
     
     def train_step_with_cfg(
@@ -197,6 +212,9 @@ class DriftingTrainer:
         """
         batch_size = x_data.shape[0]
         
+        # Apply VAE latent scaling factor (SD standard)
+        x_data = x_data * 0.18215
+        
         # Add samples to queue
         self.sample_queue.add(x_data, labels)
         
@@ -209,35 +227,47 @@ class DriftingTrainer:
         # Sample noise
         z = torch.randn(batch_size, *self.latent_shape, device=self.device)
         
-        # Generate conditional samples
-        x_gen_cond = self.model(z, labels, cfg_scale=cfg_scale)
-        
-        # Generate unconditional samples
-        uncond_labels = torch.full(
-            (batch_size,), self.sample_queue.num_classes,
-            device=self.device, dtype=torch.long
-        )
-        x_gen_uncond = self.model(z, uncond_labels, cfg_scale=1.0)
-        
-        # Get positive and unconditional samples from queue
-        x_pos = self.sample_queue.sample(labels, num_samples=1)
-        x_uncond = self.sample_queue.sample_unconditional(batch_size)
-        
-        # Compute CFG-weighted loss
-        loss = self.loss_fn.compute_with_cfg(
-            x_gen_cond, x_pos, x_uncond, cfg_scale
-        )
-        
-        # Also add unconditional loss
-        loss_uncond = self.loss_fn(x_gen_uncond, x_uncond)
-        
-        # Combine losses
-        total_loss = loss + self.uncond_prob * loss_uncond
+        # Use BF16 autocast for A100/Ampere GPUs (CUDA) or skip for CPU/other devices
+        autocast_enabled = self.device == "cuda"
+        autocast_device = self.device if self.device in ["cuda", "cpu"] else "cpu"
+        with torch.amp.autocast(device_type=autocast_device, dtype=torch.bfloat16, enabled=autocast_enabled):
+            # Generate conditional samples
+            x_gen_cond = self.model(z, labels, cfg_scale=cfg_scale)
+            
+            # Generate unconditional samples
+            uncond_labels = torch.full(
+                (batch_size,), self.sample_queue.num_classes,
+                device=self.device, dtype=torch.long
+            )
+            x_gen_uncond = self.model(z, uncond_labels, cfg_scale=1.0)
+            
+            # Get positive and unconditional samples from queue
+            x_pos = self.sample_queue.sample(labels, num_samples=1)
+            x_uncond = self.sample_queue.sample_unconditional(batch_size)
+            
+            # Compute CFG-weighted loss
+            loss = self.loss_fn.compute_with_cfg(
+                x_gen_cond, x_pos, x_uncond, cfg_scale
+            )
+            
+            # Also add unconditional loss
+            loss_uncond = self.loss_fn(x_gen_uncond, x_uncond)
+            
+            # Combine losses
+            total_loss = loss + self.uncond_prob * loss_uncond
         
         # Backward pass
         self.optimizer.zero_grad()
         total_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        
+        # Gradient clipping and norm calculation
+        grad_norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+        grad_norm_value = grad_norm.item()
+        
+        # Warn if gradient norm is zero (potential training issue)
+        if grad_norm_value == 0.0:
+            warnings.warn("Gradient norm is 0.0 - model may not be learning!")
+        
         self.optimizer.step()
         
         self._update_ema()
@@ -248,6 +278,7 @@ class DriftingTrainer:
             'loss_cond': loss.item(),
             'loss_uncond': loss_uncond.item(),
             'cfg_scale': cfg_scale,
+            'grad_norm': grad_norm_value,
         }
     
     def train_epoch(
@@ -293,6 +324,7 @@ class DriftingTrainer:
                 pbar.set_postfix({
                     'loss': f"{metrics['loss']:.4f}",
                     'cfg': f"{metrics.get('cfg_scale', 0):.2f}",
+                    'grad_norm': f"{metrics.get('grad_norm', 0):.4f}",
                 })
         
         self.epoch += 1

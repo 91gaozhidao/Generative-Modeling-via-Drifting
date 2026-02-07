@@ -152,6 +152,9 @@ def train(
     device = args.device
     print(f"Using device: {device}")
     
+    # Enable TF32 for faster matrix multiplications on A100/Ampere GPUs
+    torch.set_float32_matmul_precision('high')
+    
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
