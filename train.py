@@ -450,8 +450,8 @@ def main():
     parser.add_argument(
         "--gradient_accumulation_steps",
         type=int,
-        default=32,
-        help="Gradient accumulation steps for effective batch size (default: 32 for ~4096 effective batch)",
+        default=64,
+        help="Gradient accumulation steps for effective batch size (default: 64 for 4096 effective batch with batch_size=64)",
     )
     
     # Class-grouped sampling arguments (for single-GPU training)
