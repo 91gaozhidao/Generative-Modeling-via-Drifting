@@ -83,8 +83,12 @@ class DriftingLoss(nn.Module):
         # Track whether feature extractor is frozen
         self._feature_extractor_frozen = False
         
-        # Loss weights for each scale
-        num_scales = 4  # Default 4 scales
+        # Loss weights for each scale – derive count from the feature extractor
+        # when the caller hasn't specified explicit weights
+        if hasattr(self.feature_extractor, 'feature_dims'):
+            num_scales = len(self.feature_extractor.feature_dims)
+        else:
+            num_scales = 4  # Fallback
         if loss_weights is None:
             loss_weights = [1.0] * num_scales
         self.register_buffer('loss_weights', torch.tensor(loss_weights))

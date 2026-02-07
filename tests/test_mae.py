@@ -23,7 +23,7 @@ class TestLatentMAEEncoder:
     """Tests for LatentMAEEncoder."""
     
     def test_output_shapes(self):
-        """Test that encoder produces correct output shapes."""
+        """Test that encoder produces correct output shapes with intermediate extraction."""
         encoder = LatentMAEEncoder(
             in_channels=4,
             hidden_channels=64,
@@ -34,11 +34,28 @@ class TestLatentMAEEncoder:
         x = torch.randn(8, 4, 32, 32)
         features, pooled = encoder(x)
         
-        assert len(features) == 4
+        # With blocks_per_stage=[3,4,6,3] and extract_every_n=2:
+        # Stage 0 (3 blocks): block2, block3 -> 2 features
+        # Stage 1 (4 blocks): block2, block4 -> 2 features
+        # Stage 2 (6 blocks): block2, block4, block6 -> 3 features
+        # Stage 3 (3 blocks): block2, block3 -> 2 features
+        # Total: 9 features
+        assert len(features) == 9
+        
+        # All stage 0 features are 64ch, 32x32
         assert features[0].shape == (8, 64, 32, 32)
-        assert features[1].shape == (8, 128, 16, 16)
-        assert features[2].shape == (8, 256, 8, 8)
-        assert features[3].shape == (8, 512, 4, 4)
+        assert features[1].shape == (8, 64, 32, 32)
+        # Stage 1 features: 128ch, 16x16
+        assert features[2].shape == (8, 128, 16, 16)
+        assert features[3].shape == (8, 128, 16, 16)
+        # Stage 2 features: 256ch, 8x8
+        assert features[4].shape == (8, 256, 8, 8)
+        assert features[5].shape == (8, 256, 8, 8)
+        assert features[6].shape == (8, 256, 8, 8)
+        # Stage 3 features: 512ch, 4x4
+        assert features[7].shape == (8, 512, 4, 4)
+        assert features[8].shape == (8, 512, 4, 4)
+        
         assert pooled.shape == (8, 512)
     
     def test_forward_features(self):
@@ -52,18 +69,19 @@ class TestLatentMAEEncoder:
         x = torch.randn(4, 4, 32, 32)
         features = encoder.forward_features(x)
         
-        assert len(features) == 4
+        assert len(features) == 9  # Intermediate extraction
         assert all(isinstance(f, torch.Tensor) for f in features)
     
     def test_feature_dims(self):
-        """Test that feature_dims is correctly computed."""
+        """Test that feature_dims is correctly computed with intermediates."""
         encoder = LatentMAEEncoder(
             in_channels=4,
             hidden_channels=64,
             num_stages=4,
         )
         
-        assert encoder.feature_dims == [64, 128, 256, 512]
+        # With extract_every_n=2 and blocks=[3,4,6,3]
+        assert encoder.feature_dims == [64, 64, 128, 128, 256, 256, 256, 512, 512]
         assert encoder.final_dim == 512
 
 
@@ -345,5 +363,6 @@ class TestMAEIntegration:
             x = torch.randn(4, 4, 32, 32)
             features = feature_extractor(x)
             
-            assert len(features) == 4
+            # With intermediate extraction, we get 9 features
+            assert len(features) == 9
             assert all(not torch.isnan(f).any() for f in features)

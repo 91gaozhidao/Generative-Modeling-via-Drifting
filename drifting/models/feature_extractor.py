@@ -69,6 +69,8 @@ class FeatureExtractor(nn.Module):
         num_blocks: Number of blocks per stage (default: [2, 2, 2, 2])
         pretrained_encoder: Optional pretrained encoder to use (e.g., 'resnet18')
         freeze_pretrained: Whether to freeze pretrained weights
+        is_latent: If True, use a 3×3 stride-1 stem without MaxPool for
+            latent-space inputs (Paper A.3). Default False.
     """
     
     def __init__(
@@ -78,6 +80,7 @@ class FeatureExtractor(nn.Module):
         num_blocks: List[int] = None,
         pretrained_encoder: Optional[str] = None,
         freeze_pretrained: bool = True,
+        is_latent: bool = False,
     ):
         super().__init__()
         
@@ -86,6 +89,7 @@ class FeatureExtractor(nn.Module):
         
         self.in_channels = in_channels
         self.pretrained_encoder = pretrained_encoder
+        self.is_latent = is_latent
         
         if pretrained_encoder:
             self._build_pretrained(pretrained_encoder, freeze_pretrained)
@@ -135,11 +139,23 @@ class FeatureExtractor(nn.Module):
                     param.requires_grad = True
     
     def _build_custom(self, in_channels: int, base_channels: int, num_blocks: List[int]):
-        """Build a custom ResNet-style encoder with GroupNorm (Paper A.3)."""
-        self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
+        """Build a custom ResNet-style encoder with GroupNorm (Paper A.3).
+        
+        When ``self.is_latent`` is True the input stem uses a 3×3 stride-1
+        convolution **without** MaxPool, preserving the spatial resolution of
+        small latent inputs (e.g. 32×32).  Otherwise the standard 7×7 stride-2
+        + MaxPool stem is used.
+        """
+        if self.is_latent:
+            # Latent mode: 3x3 stride-1, no MaxPool (Paper A.3)
+            self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        else:
+            # Standard ResNet stem: 7x7 stride-2
+            self.input_conv = nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
         self.norm1 = _make_norm(base_channels)
         self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+        if not self.is_latent:
+            self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
         # Build stages
         channels = [base_channels, base_channels * 2, base_channels * 4, base_channels * 8]
@@ -172,7 +188,8 @@ class FeatureExtractor(nn.Module):
         x = self.input_conv(x)
         x = self.norm1(x)
         x = self.relu(x)
-        x = self.maxpool(x)
+        if not self.is_latent:
+            x = self.maxpool(x)
         
         # Extract features at each stage
         features = []
@@ -218,12 +235,25 @@ class LatentFeatureExtractor(nn.Module):
     Since the latent space is already a good representation,
     we use a ResNet-style encoder with BasicBlocks.
     
+    Per paper Appendix A.3: for latent-space inputs the first stage uses
+    stride 1 (no downsampling) — no stem conv or MaxPool.
+    
+    Per paper Appendix A.5: features are extracted from the output of every
+    2 residual blocks within each stage, together with the final output.
+    
     This encoder can be pretrained using MAE (Masked Autoencoding) as described
     in the paper's Appendix A.3:
     > "We use a ResNet-style network... pre-trained with MAE... on the VAE latent space."
     > "We found it crucial to use a feature extractor... raw pixels/latents failed."
     > "All residual blocks are 'basic' blocks"
     > "ResNet-style encoder... blocks/stage [3, 4, 6, 3]"
+    
+    Args:
+        in_channels: Input channels (default: 4 for VAE latent)
+        hidden_channels: Base width (default: 64)
+        num_stages: Number of encoder stages (default: 4)
+        blocks_per_stage: Blocks per stage (default: [3, 4, 6, 3])
+        extract_every_n: Extract intermediate features every N blocks (default: 2, per A.5)
     """
     
     def __init__(
@@ -232,12 +262,14 @@ class LatentFeatureExtractor(nn.Module):
         hidden_channels: int = 64,
         num_stages: int = 4,
         blocks_per_stage: Optional[List[int]] = None,
+        extract_every_n: int = 2,
     ):
         super().__init__()
         
         self.in_channels = in_channels
         self.hidden_channels = hidden_channels
         self.num_stages = num_stages
+        self.extract_every_n = extract_every_n
         self.stages = nn.ModuleList()
         
         if blocks_per_stage is None:
@@ -251,30 +283,39 @@ class LatentFeatureExtractor(nn.Module):
         in_ch = in_channels
         out_ch = hidden_channels
         
-        # Feature dims: natural channel expansion, no artificial cap
+        # Feature dims: one entry per extraction point
         self.feature_dims = []
         
         for i in range(num_stages):
             stride = 2 if i > 0 else 1
             num_blocks = blocks_per_stage[i]
             
-            # Build stage with ResNet BasicBlocks
-            blocks = [ResNetBlock(in_ch, out_ch, stride=stride)]
+            # Build stage as ModuleList to allow per-block feature extraction
+            blocks = nn.ModuleList()
+            blocks.append(ResNetBlock(in_ch, out_ch, stride=stride))
             for _ in range(1, num_blocks):
                 blocks.append(ResNetBlock(out_ch, out_ch, stride=1))
             
-            self.stages.append(nn.Sequential(*blocks))
-            self.feature_dims.append(out_ch)
+            self.stages.append(blocks)
+            
+            # Record dims for each extraction point in this stage
+            for b_idx in range(num_blocks):
+                if (b_idx + 1) % extract_every_n == 0 or b_idx == num_blocks - 1:
+                    self.feature_dims.append(out_ch)
             
             in_ch = out_ch
             out_ch = out_ch * 2  # Natural expansion, no cap
     
     def forward(self, x: torch.Tensor) -> List[torch.Tensor]:
-        """Extract multi-scale features."""
+        """Extract multi-scale features with intermediate extraction (Paper A.5)."""
         features = []
-        for stage in self.stages:
-            x = stage(x)
-            features.append(x)
+        for stage_blocks in self.stages:
+            num_blocks = len(stage_blocks)
+            for b_idx, block in enumerate(stage_blocks):
+                x = block(x)
+                # Extract at every Nth block and always at the stage end
+                if (b_idx + 1) % self.extract_every_n == 0 or b_idx == num_blocks - 1:
+                    features.append(x)
         return features
     
     def load_pretrained(self, checkpoint_path: str, strict: bool = True) -> None:

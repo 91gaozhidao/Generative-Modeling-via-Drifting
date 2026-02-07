@@ -80,12 +80,20 @@ class LatentMAEEncoder(nn.Module):
     Uses BasicBlock residual blocks with configurable blocks per stage.
     Channel widths expand naturally without artificial caps.
     
+    Per paper Appendix A.3: for latent-space inputs the encoder uses a 3×3
+    stride-1 convolution (no downsampling) as the input stem, and no MaxPool.
+    
+    Per paper Appendix A.5: features are extracted from the output of every
+    2 residual blocks within each stage, together with the final output.
+    This provides denser supervision signals for the drifting field.
+    
     Args:
         in_channels: Number of input channels (default: 4 for VAE latent)
         hidden_channels: Base hidden dimension / base width (default: 64)
         num_stages: Number of encoder stages (default: 4)
         patch_size: Patch size for masking (default: 4)
         blocks_per_stage: Number of BasicBlocks per stage (default: [3, 4, 6, 3] for L/2)
+        extract_every_n: Extract intermediate features every N blocks (default: 2, per A.5)
     """
     
     def __init__(
@@ -95,6 +103,7 @@ class LatentMAEEncoder(nn.Module):
         num_stages: int = 4,
         patch_size: int = 4,
         blocks_per_stage: Optional[List[int]] = None,
+        extract_every_n: int = 2,
     ):
         super().__init__()
         
@@ -102,6 +111,7 @@ class LatentMAEEncoder(nn.Module):
         self.hidden_channels = hidden_channels
         self.num_stages = num_stages
         self.patch_size = patch_size
+        self.extract_every_n = extract_every_n
         
         if blocks_per_stage is None:
             blocks_per_stage = [3, 4, 6, 3]
@@ -113,9 +123,10 @@ class LatentMAEEncoder(nn.Module):
         self.blocks_per_stage = blocks_per_stage
         
         # Build encoder stages with proper ResNet BasicBlocks
+        # Use ModuleList of ModuleLists to allow intermediate feature extraction
         self.stages = nn.ModuleList()
         
-        # Feature dimensions at each stage (natural expansion, no cap)
+        # Feature dimensions for each extracted feature map
         self.feature_dims = []
         
         in_ch = in_channels
@@ -125,19 +136,36 @@ class LatentMAEEncoder(nn.Module):
             stride = 2 if i > 0 else 1
             num_blocks = blocks_per_stage[i]
             
-            # Build stage: first block handles channel change & downsampling
-            blocks = [BasicBlock(in_ch, out_ch, stride=stride)]
+            # Build stage as ModuleList of individual blocks
+            blocks = nn.ModuleList()
+            blocks.append(BasicBlock(in_ch, out_ch, stride=stride))
             for _ in range(1, num_blocks):
                 blocks.append(BasicBlock(out_ch, out_ch, stride=1))
             
-            self.stages.append(nn.Sequential(*blocks))
-            self.feature_dims.append(out_ch)
+            self.stages.append(blocks)
+            
+            # Record feature dims for intermediate extraction points
+            for b_idx in range(num_blocks):
+                if (b_idx + 1) % extract_every_n == 0 or b_idx == num_blocks - 1:
+                    self.feature_dims.append(out_ch)
             
             in_ch = out_ch
             out_ch = out_ch * 2  # Natural channel expansion, no cap
         
         # Final feature dimension (after global average pooling)
         self.final_dim = self.feature_dims[-1]
+    
+    def _forward_with_intermediates(self, x: torch.Tensor) -> List[torch.Tensor]:
+        """Extract features every ``extract_every_n`` blocks (Paper A.5)."""
+        features = []
+        for stage_blocks in self.stages:
+            num_blocks = len(stage_blocks)
+            for b_idx, block in enumerate(stage_blocks):
+                x = block(x)
+                # Extract at every Nth block and always at the stage end
+                if (b_idx + 1) % self.extract_every_n == 0 or b_idx == num_blocks - 1:
+                    features.append(x)
+        return features
     
     def forward(self, x: torch.Tensor) -> Tuple[List[torch.Tensor], torch.Tensor]:
         """
@@ -149,13 +177,10 @@ class LatentMAEEncoder(nn.Module):
         Returns:
             Tuple of (list of multi-scale features, final pooled features)
         """
-        features = []
-        for stage in self.stages:
-            x = stage(x)
-            features.append(x)
+        features = self._forward_with_intermediates(x)
         
         # Global average pool the final features
-        pooled = F.adaptive_avg_pool2d(x, 1).flatten(1)
+        pooled = F.adaptive_avg_pool2d(features[-1], 1).flatten(1)
         
         return features, pooled
     
@@ -167,13 +192,9 @@ class LatentMAEEncoder(nn.Module):
             x: Input tensor of shape (B, C, H, W)
             
         Returns:
-            List of feature tensors at each scale
+            List of feature tensors at each scale (including intermediates)
         """
-        features = []
-        for stage in self.stages:
-            x = stage(x)
-            features.append(x)
-        return features
+        return self._forward_with_intermediates(x)
 
 
 class LatentMAEDecoder(nn.Module):
