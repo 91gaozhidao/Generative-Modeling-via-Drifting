@@ -326,6 +326,8 @@ class LatentMAE(nn.Module):
         
         # Classification head for fine-tuning (Paper Appendix A.3, Table 3)
         self.classifier_head = nn.Linear(self.encoder.final_dim, num_classes)
+        nn.init.trunc_normal_(self.classifier_head.weight, std=0.02)
+        nn.init.zeros_(self.classifier_head.bias)
         
         # Mask token for masked patches
         self.mask_token = nn.Parameter(torch.zeros(1, in_channels, 1, 1))
